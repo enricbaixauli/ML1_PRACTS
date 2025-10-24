@@ -1,5 +1,8 @@
 # Auxiliary file with functions from previous units
 # build class from pract 2
+
+using Statistics
+
 function buildClassANN(numInputs::Int, topology::AbstractArray{<:Int,1}, numOutputs::Int;
     transferFunctions::AbstractArray{<:Function,1}=fill(σ, length(topology)))
 
@@ -351,4 +354,138 @@ function confusionMatrix(outputs::AbstractArray{<:Any,1}, targets::AbstractArray
 
     # and then we call the previous function
     return confusionMatrix(outputs, targets, classes; weighted=weighted)
+end
+
+
+function ANNCrossValidation(topology::AbstractArray{<:Int,1},
+        dataset::Tuple{AbstractArray{<:Real,2}, AbstractArray{<:Any,1}},
+        crossValidationIndices::Array{Int64,1};
+        numExecutions::Int=50,
+        transferFunctions::AbstractArray{<:Function,1}=fill(σ, length(topology)),
+        maxEpochs::Int=1000, minLoss::Real=0.0, learningRate::Real=0.01,
+        validationRatio::Real=0, maxEpochsVal::Int=20)
+    #TODO
+    # 1- we get the classes via the targets
+    classes = sort(unique(dataset[2]))
+
+    # 2- then we do a one-hot encoding
+    classesEncoded= oneHotEncoding(classes)
+
+    # 3- we get the number of numFolds
+    numFolds = maximum(crossValidationIndices)
+
+    # 4- we create the vectors for the metrics to store the information of each fold
+    # to do so properly, first we must get the number of classes
+    numClasses = length(classes)
+
+    accuracyList = zeros(numFolds)
+    errorRate = zeros(numFolds)
+
+    sensitivityList = zeros(numClasses, numFolds)
+    specificityList = zeros(numClasses, numFolds)
+    posPredValList = zeros(numClasses, numFolds)
+    negPredValList = zeros(numClasses, numFolds)
+    fScoreList = zeros(numClasses, numFolds)
+
+    # 5- we prepare the variable to store the accumulation of the confussion matrix
+    globalConfusionMatrix = zeros(numClasses, numClasses, numFolds)
+
+    # we get the partitions
+    listFoldData = []
+    # findall(x .== fold)
+    for fold in 1:numFolds
+        listCurrentFold = findall(x -> x == fold, crossValidationIndices)
+        dataCurrentFold = (dataset[1][listCurrentFold, :], dataset[2][listCurrentFold])
+        push!(listFoldData, dataCurrentFold)
+    end
+    
+    # and then, we start the execution of the folds
+    for fold in 1:numFolds
+        # first, we prepare the space for the metrics (per execution)
+        perExecutionAccuracy = zeros(numExecutions)
+        perExecutionErrorRate = zeros(numExecutions)
+
+        perExecutionSensitivityList = zeros(numClasses, numExecutions)
+        perExecutionSpecificityList = zeros(numClasses, numExecutions)
+        perExecutionPosPredValList = zeros(numClasses, numExecutions)
+        perExecutionNegPredValList = zeros(numClasses, numExecutions)
+        perExecutionFScoreList = zeros(numClasses, numExecutions)
+
+        perExecutionConfMatrix = zeros(numClasses, numClasses, numExecutions)
+        
+        # then we get the test dataset, as it is just one fold, which can be the current one
+        testDataset = listFoldData[fold]
+
+        # in case there's a validation ratio, we must obtain the division between training and validation using holdOut
+        if validationRatio > 0
+            train, validate = holdOut(numFolds-1, validationRatio)
+            for i in eachindex(train)
+                if train[i] >= fold
+                    train[i] += 1
+                end
+            end
+            
+            for i in eachindex(validate)
+                if validate[i] >= fold
+                    validate[i] += 1
+                end
+            end
+            
+            trainingX = vcat([listFoldData[i][1] for i in train]...)
+            trainingY = vcat([listFoldData[i][2] for i in train]...)
+            trainingDataset = (trainingX, trainingY)
+
+            validationX = vcat([listFoldData[i][1] for i in validate]...)
+            validationY = vcat([listFoldData[i][2] for i in validate]...)
+            validationDataset = (validationX, validationY)
+        
+        # otherwise, everything else other than the current test fold goes to the training set
+        else
+            # we get the index that are not test
+            train = filter(i -> i != fold, 1:numFolds)
+
+            trainingX = vcat([listFoldData[i][1] for i in train]...)
+            trainingY = vcat([listFoldData[i][2] for i in train]...)
+            trainingDataset = (trainingX, trainingY)
+            validationDataset = (Array{eltype(trainingDataset[1]),2}(undef,0,0), falses(0))
+
+        end
+        
+        # and now that we have the sets, we start doing the amount of expected executions (because ann are indeterministic)
+        # and then we obtain the metrics per execution
+        for j in 1:numExecutions
+            ann, _, _, _ = trainClassANN(topology, trainingDataset, validationDataset, testDataset, transferFunctions, maxEpochs, minLoss, learningRate, maxEpochsVal, false)
+            x_test, y_test = testDataset
+            y_pred = ann(x_test')
+            perExecutionAccuracy[j], perExecutionErrorRate[j], perExecutionSensitivityList[:, j], perExecutionSpecificityList[:, j], perExecutionPosPredValList[:, j], perExecutionNegPredValList[:, j], perExecutionFScoreList[:, j], perExecutionConfMatrix[:, :, j] = confusionMatrix(y_pred', y_test)
+        end
+        # and, after all the execution, we introduce the mean into the external lists
+        accuracyList[fold] = mean(perExecutionAccuracy)
+        errorRate[fold] = mean(perExecutionErrorRate)
+
+        sensitivityList[:, fold] = dropdims(mean(perExecutionSensitivityList, dims=2); dims=2)
+        specificityList[:, fold] = dropdims(mean(perExecutionSpecificityList, dims=2); dims=2)
+        posPredValList[:, fold] = dropdims(mean(perExecutionPosPredValList, dims=2); dims=2)
+        negPredValList[:, fold] = dropdims(mean(perExecutionNegPredValList, dims=2); dims=2)
+        fScoreList[:, fold] = dropdims(mean(perExecutionFScoreList, dims=2); dims=2)
+        
+        globalConfusionMatrix[:,:,fold] = dropdims(mean(perExecutionConfMatrix, dims=3); dims=3)
+    end
+    #now, after the loop, this are the following returned data:
+    """ 1. Accuracy (mean, std)
+        2. Error rate (mean, std)
+        3. Sensitivity (mean, std)
+        4. Specificity (mean, std)
+        5. PPV (mean, std)
+        6. NPV (mean, std)
+        7. F1-score (mean, std)
+        8. Global test confusion matrix (which is basically the mean?)"""
+    return ((mean(accuracyList), std(accuracyList)), (mean(errorRate), std(errorRate)),
+    (dropdims(mean(sensitivityList, dims=2); dims=2), dropdims(std(sensitivityList, dims=2); dims=2)),
+    (dropdims(mean(specificityList, dims=2); dims=2), dropdims(std(specificityList, dims=2); dims=2)),
+    (dropdims(mean(posPredValList, dims=2); dims=2), dropdims(std(posPredValList, dims=2); dims=2)),
+    (dropdims(mean(negPredValList, dims=2); dims=2), dropdims(std(negPredValList, dims=2); dims=2)),
+    (dropdims(mean(fScoreList, dims=2); dims=2), dropdims(std(fScoreList, dims=2); dims=2)),   
+    dropdims(sum(globalConfusionMatrix, dims=3); dims=3))
+
 end
